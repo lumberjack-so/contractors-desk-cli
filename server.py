@@ -154,6 +154,82 @@ TOOLS = [
 
 app = FastAPI(title="Cratchit Realtime Voice")
 
+# MCP session management
+_mcp_session_id: str | None = None
+_mcp_lock = asyncio.Lock()
+_mcp_request_id = 0
+
+
+def _next_mcp_id() -> int:
+    global _mcp_request_id
+    _mcp_request_id += 1
+    return _mcp_request_id
+
+
+def _parse_sse_data(text: str) -> dict | None:
+    """Extract JSON from SSE text/event-stream response."""
+    for line in text.splitlines():
+        if line.startswith("data: "):
+            try:
+                return json.loads(line[6:])
+            except json.JSONDecodeError:
+                continue
+    return None
+
+
+async def _mcp_post(client: httpx.AsyncClient, payload: dict, session_id: str | None = None) -> tuple[dict | None, str | None]:
+    """POST to MCP endpoint, handle SSE or JSON response. Returns (data, session_id)."""
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+    }
+    if session_id:
+        headers["Mcp-Session-Id"] = session_id
+
+    resp = await client.post(CRATCHIT_MCP_URL, json=payload, headers=headers)
+    new_session = resp.headers.get("mcp-session-id", session_id)
+
+    content_type = resp.headers.get("content-type", "")
+    if "text/event-stream" in content_type:
+        data = _parse_sse_data(resp.text)
+    else:
+        data = resp.json()
+
+    return data, new_session
+
+
+async def _ensure_mcp_session(client: httpx.AsyncClient) -> str:
+    """Initialize MCP session if needed, return session ID."""
+    global _mcp_session_id
+    if _mcp_session_id:
+        return _mcp_session_id
+
+    async with _mcp_lock:
+        if _mcp_session_id:
+            return _mcp_session_id
+
+        init_payload = {
+            "jsonrpc": "2.0",
+            "id": _next_mcp_id(),
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "realtime-mode", "version": "0.1.0"},
+            },
+        }
+        data, session_id = await _mcp_post(client, init_payload)
+        if session_id:
+            _mcp_session_id = session_id
+            log.info("MCP session initialized: %s", session_id)
+
+            # Send initialized notification
+            notif = {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}
+            headers = {"Content-Type": "application/json", "Mcp-Session-Id": session_id}
+            await client.post(CRATCHIT_MCP_URL, json=notif, headers=headers)
+
+        return _mcp_session_id or ""
+
 
 @app.get("/health")
 async def health():
@@ -164,14 +240,10 @@ async def health():
 async def test():
     results = {"openai_key_set": bool(OPENAI_API_KEY), "mcp_url": CRATCHIT_MCP_URL}
     try:
-        async with httpx.AsyncClient(timeout=5) as client:
-            resp = await client.post(
-                CRATCHIT_MCP_URL,
-                json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
-                headers={"Content-Type": "application/json"},
-            )
-            results["mcp_status"] = resp.status_code
-            results["mcp_reachable"] = resp.status_code == 200
+        async with httpx.AsyncClient(timeout=10) as client:
+            session_id = await _ensure_mcp_session(client)
+            results["mcp_session"] = bool(session_id)
+            results["mcp_reachable"] = bool(session_id)
     except Exception as e:
         results["mcp_reachable"] = False
         results["mcp_error"] = str(e)
@@ -184,28 +256,32 @@ async def voice_page():
 
 
 async def call_mcp_tool(tool_name: str, arguments: dict) -> str:
-    """Call a tool on the Cratchit MCP server."""
-    payload = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {"name": tool_name, "arguments": arguments},
-    }
+    """Call a tool on the Cratchit MCP server via MCP Streamable HTTP."""
+    global _mcp_session_id
     try:
         async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(
-                CRATCHIT_MCP_URL,
-                json=payload,
-                headers={"Content-Type": "application/json"},
-            )
-            data = resp.json()
-            if "result" in data and "content" in data["result"]:
+            session_id = await _ensure_mcp_session(client)
+
+            payload = {
+                "jsonrpc": "2.0",
+                "id": _next_mcp_id(),
+                "method": "tools/call",
+                "params": {"name": tool_name, "arguments": arguments},
+            }
+            data, new_session = await _mcp_post(client, payload, session_id)
+            if new_session:
+                _mcp_session_id = new_session
+
+            if data and "result" in data and "content" in data["result"]:
                 contents = data["result"]["content"]
                 if contents and len(contents) > 0:
                     return contents[0].get("text", json.dumps(contents))
-            return json.dumps(data)
+            if data and "error" in data:
+                return json.dumps(data["error"])
+            return json.dumps(data) if data else '{"error": "empty response"}'
     except Exception as e:
         log.error("MCP call failed: %s", e)
+        _mcp_session_id = None  # Reset session on error
         return json.dumps({"error": str(e)})
 
 
