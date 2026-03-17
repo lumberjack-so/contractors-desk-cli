@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Cratchit Voice</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  background: #111;
+  color: #e0e0e0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+  padding: 1rem;
+}
+h1 { font-size: 1.2rem; margin-bottom: 0.5rem; color: #888; font-weight: 400; }
+#btn {
+  width: 120px; height: 120px;
+  border-radius: 50%;
+  border: 3px solid #444;
+  background: #222;
+  color: #ccc;
+  font-size: 0.85rem;
+  cursor: pointer;
+  transition: all 0.2s;
+  margin: 1.5rem 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  line-height: 1.3;
+}
+#btn:hover { border-color: #666; background: #2a2a2a; }
+#btn.listening { border-color: #4a9; background: #1a3a2a; color: #6fc; animation: pulse 2s infinite; }
+#btn.speaking { border-color: #49a; background: #1a2a3a; color: #6cf; }
+#btn.processing { border-color: #a94; background: #3a2a1a; color: #fc6; }
+#btn.connected { border-color: #555; }
+@keyframes pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(68, 170, 153, 0.3); }
+  50% { box-shadow: 0 0 0 15px rgba(68, 170, 153, 0); }
+}
+#status { font-size: 0.8rem; color: #666; margin-bottom: 0.5rem; min-height: 1.2em; }
+#tool-activity { font-size: 0.75rem; color: #a94; min-height: 1em; margin-bottom: 1rem; }
+#transcript {
+  width: 100%; max-width: 500px;
+  max-height: 200px;
+  overflow-y: auto;
+  font-size: 0.8rem;
+  color: #777;
+  padding: 0.5rem;
+  border-top: 1px solid #333;
+  margin-top: 1rem;
+}
+#transcript .line { margin-bottom: 0.3rem; }
+#error { color: #e55; font-size: 0.8rem; margin-top: 0.5rem; }
+</style>
+</head>
+<body>
+<h1>C.H. Anderson Construction</h1>
+<div id="status">Ready</div>
+<button id="btn" onclick="toggle()">Talk to<br>Cratchit</button>
+<div id="tool-activity"></div>
+<div id="error"></div>
+<div id="transcript"></div>
+
+<script>
+const btn = document.getElementById('btn');
+const statusEl = document.getElementById('status');
+const toolEl = document.getElementById('tool-activity');
+const errorEl = document.getElementById('error');
+const transcriptEl = document.getElementById('transcript');
+
+let ws = null;
+let audioCtx = null;
+let mediaStream = null;
+let scriptNode = null;
+let sourceNode = null;
+let connected = false;
+let playbackQueue = [];
+let isPlaying = false;
+let nextPlayTime = 0;
+
+function setStatus(s) {
+  const labels = { idle: 'Connected', listening: 'Listening...', speaking: 'Cratchit is speaking...', processing: 'Processing...' };
+  statusEl.textContent = labels[s] || s;
+  btn.className = connected ? (s === 'idle' ? 'connected' : s) : '';
+}
+
+function addTranscript(text) {
+  const d = document.createElement('div');
+  d.className = 'line';
+  d.textContent = text;
+  transcriptEl.appendChild(d);
+  transcriptEl.scrollTop = transcriptEl.scrollHeight;
+}
+
+let currentTranscript = '';
+
+function toggle() {
+  if (connected) disconnect();
+  else connect();
+}
+
+async function connect() {
+  errorEl.textContent = '';
+  toolEl.textContent = '';
+  transcriptEl.innerHTML = '';
+  currentTranscript = '';
+
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(`${proto}//${location.host}/voice/ws`);
+  ws.binaryType = 'arraybuffer';
+
+  ws.onopen = async () => {
+    connected = true;
+    btn.textContent = 'Disconnect';
+    setStatus('idle');
+    await startMic();
+  };
+
+  ws.onmessage = (e) => {
+    if (e.data instanceof ArrayBuffer) {
+      enqueuePCM(e.data);
+    } else {
+      const msg = JSON.parse(e.data);
+      if (msg.type === 'status') setStatus(msg.status);
+      else if (msg.type === 'tool_activity') {
+        toolEl.textContent = msg.done ? '' : msg.label;
+      } else if (msg.type === 'transcript') {
+        currentTranscript += msg.delta;
+      } else if (msg.type === 'error') {
+        errorEl.textContent = msg.message;
+      }
+    }
+  };
+
+  ws.onclose = () => { disconnect(); };
+  ws.onerror = () => { errorEl.textContent = 'Connection error'; disconnect(); };
+}
+
+function disconnect() {
+  connected = false;
+  btn.textContent = 'Talk to\nCratchit';
+  btn.className = '';
+  setStatus('Ready');
+  if (currentTranscript) { addTranscript(currentTranscript); currentTranscript = ''; }
+  stopMic();
+  if (ws) { ws.close(); ws = null; }
+  playbackQueue = [];
+  isPlaying = false;
+  nextPlayTime = 0;
+}
+
+async function startMic() {
+  try {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
+    mediaStream = await navigator.mediaDevices.getUserMedia({ audio: { sampleRate: 24000, channelCount: 1, echoCancellation: true, noiseSuppression: true } });
+    sourceNode = audioCtx.createMediaStreamSource(mediaStream);
+    scriptNode = audioCtx.createScriptProcessor(4096, 1, 1);
+    scriptNode.onaudioprocess = (e) => {
+      if (!connected || !ws || ws.readyState !== 1) return;
+      const float32 = e.inputBuffer.getChannelData(0);
+      const pcm16 = new Int16Array(float32.length);
+      for (let i = 0; i < float32.length; i++) {
+        const s = Math.max(-1, Math.min(1, float32[i]));
+        pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+      }
+      ws.send(pcm16.buffer);
+    };
+    sourceNode.connect(scriptNode);
+    scriptNode.connect(audioCtx.destination);
+  } catch (err) {
+    errorEl.textContent = 'Mic access denied';
+  }
+}
+
+function stopMic() {
+  if (scriptNode) { scriptNode.disconnect(); scriptNode = null; }
+  if (sourceNode) { sourceNode.disconnect(); sourceNode = null; }
+  if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
+  if (audioCtx) { audioCtx.close(); audioCtx = null; }
+}
+
+function enqueuePCM(buf) {
+  if (!audioCtx) return;
+  const int16 = new Int16Array(buf);
+  const float32 = new Float32Array(int16.length);
+  for (let i = 0; i < int16.length; i++) {
+    float32[i] = int16[i] / 0x8000;
+  }
+  const ab = audioCtx.createBuffer(1, float32.length, 24000);
+  ab.getChannelData(0).set(float32);
+  const src = audioCtx.createBufferSource();
+  src.buffer = ab;
+  src.connect(audioCtx.destination);
+  const now = audioCtx.currentTime;
+  const start = Math.max(now, nextPlayTime);
+  src.start(start);
+  nextPlayTime = start + ab.duration;
+}
+</script>
+</body>
+</html>
