@@ -241,9 +241,28 @@ async def test():
     results = {"openai_key_set": bool(OPENAI_API_KEY), "mcp_url": CRATCHIT_MCP_URL}
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            session_id = await _ensure_mcp_session(client)
-            results["mcp_session"] = bool(session_id)
-            results["mcp_reachable"] = bool(session_id)
+            init_payload = {
+                "jsonrpc": "2.0",
+                "id": 0,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": {"name": "realtime-mode-test", "version": "0.1.1"},
+                },
+            }
+            headers = {
+                "Content-Type": "application/json",
+                "Accept": "application/json, text/event-stream",
+            }
+            resp = await client.post(CRATCHIT_MCP_URL, json=init_payload, headers=headers)
+            content_type = resp.headers.get("content-type", "")
+            if "text/event-stream" in content_type:
+                data = _parse_sse_data(resp.text)
+            else:
+                data = resp.json()
+            reachable = bool(data and "jsonrpc" in data and "result" in data)
+            results["mcp_reachable"] = reachable
     except Exception as e:
         results["mcp_reachable"] = False
         results["mcp_error"] = str(e)

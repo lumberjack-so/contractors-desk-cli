@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.1.1
+
+- Fix `/test` endpoint MCP reachability check: send a proper `initialize` JSON-RPC request with correct headers and validate the response, instead of relying on cached session state
+
 ## v0.1.0
 
 Initial release.
