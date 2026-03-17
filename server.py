@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import sqlite3
+from datetime import datetime, timezone
 
 import httpx
 from dotenv import load_dotenv
@@ -20,11 +21,12 @@ log = logging.getLogger("realtime")
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 CRATCHIT_MCP_URL = os.environ.get("CRATCHIT_MCP_URL", "http://localhost:8771/mcp/mcp")
-OPENAI_REALTIME_URL = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview"
+OPENAI_REALTIME_URL = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-1.5"
 
 SOUL_MD_PATH = "/home/admin/.openclaw/workspace/SOUL.md"
 MEMORY_MD_PATH = "/home/admin/.openclaw/workspace/MEMORY.md"
 LCM_DB_PATH = "/home/admin/.openclaw/lcm.db"
+VOICE_LOG_PATH = "/home/admin/.openclaw/workspace/voice-log.md"
 
 
 def _read_file(path: str) -> str:
@@ -67,10 +69,36 @@ def assemble_lcm_context(db_path: str = LCM_DB_PATH, max_chars: int = 40000) -> 
         return f"[LCM context unavailable: {e}]"
 
 
+def _load_voice_log(max_chars: int = 10000) -> str:
+    """Load tail of voice-log.md, capped at max_chars."""
+    try:
+        with open(VOICE_LOG_PATH, "r") as f:
+            content = f.read()
+        if len(content) > max_chars:
+            content = content[-max_chars:]
+        log.info("Voice log loaded: %d chars", len(content))
+        return content
+    except FileNotFoundError:
+        return ""
+    except Exception as e:
+        log.warning("Failed to read voice log: %s", e)
+        return ""
+
+
 def build_system_prompt() -> str:
     soul_md = _read_file(SOUL_MD_PATH)
     memory_md = _read_file(MEMORY_MD_PATH)
     lcm_context = assemble_lcm_context()
+    voice_log = _load_voice_log()
+
+    voice_history_section = ""
+    if voice_log:
+        voice_history_section = f"""
+
+---
+
+## Voice Session History
+{voice_log}"""
 
     return f"""{soul_md}
 
@@ -82,7 +110,7 @@ def build_system_prompt() -> str:
 ---
 
 ## Conversation History
-{lcm_context}
+{lcm_context}{voice_history_section}
 
 ---
 
@@ -406,6 +434,9 @@ async def voice_ws(ws: WebSocket):
 
     log.info("Connected to OpenAI Realtime API")
 
+    # Transcript collection for this session
+    transcript_turns: list[dict] = []
+
     # Build dynamic system prompt with full context
     instructions = build_system_prompt()
     log.info(f"Session context loaded: {len(instructions)} chars")
@@ -415,7 +446,7 @@ async def voice_ws(ws: WebSocket):
         "type": "session.update",
         "session": {
             "instructions": instructions,
-            "voice": "alloy",
+            "voice": "cedar",
             "input_audio_format": "pcm16",
             "output_audio_format": "pcm16",
             "tools": TOOLS,
@@ -454,7 +485,19 @@ async def voice_ws(ws: WebSocket):
                 event = json.loads(raw)
                 etype = event.get("type", "")
 
-                if etype == "response.audio.delta":
+                if etype == "conversation.item.created":
+                    item = event.get("item", {})
+                    if item.get("type") == "message":
+                        role = item.get("role", "unknown")
+                        parts = item.get("content", [])
+                        text = " ".join(
+                            p.get("transcript") or p.get("text") or ""
+                            for p in parts
+                        ).strip()
+                        if text:
+                            transcript_turns.append({"role": role, "text": text})
+
+                elif etype == "response.audio.delta":
                     audio_bytes = base64.b64decode(event["delta"])
                     await ws.send_bytes(audio_bytes)
 
@@ -518,6 +561,20 @@ async def voice_ws(ws: WebSocket):
         log.error("WebSocket session ended: %s", e)
     finally:
         await openai_ws.close()
+        if transcript_turns:
+            try:
+                ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+                lines = [f"## Voice Session — {ts}\n"]
+                for turn in transcript_turns:
+                    lines.append(f"**{turn['role']}:** {turn['text']}")
+                lines.append("\n---\n")
+                block = "\n".join(lines)
+                os.makedirs(os.path.dirname(VOICE_LOG_PATH), exist_ok=True)
+                with open(VOICE_LOG_PATH, "a") as f:
+                    f.write(block)
+                log.info("Transcript saved: %d turns", len(transcript_turns))
+            except Exception as e:
+                log.error("Failed to save transcript: %s", e)
         log.info("Session closed")
 
 
