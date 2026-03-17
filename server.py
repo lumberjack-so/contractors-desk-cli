@@ -5,6 +5,7 @@ import base64
 import json
 import logging
 import os
+import sqlite3
 
 import httpx
 from dotenv import load_dotenv
@@ -21,15 +22,72 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 CRATCHIT_MCP_URL = os.environ.get("CRATCHIT_MCP_URL", "http://localhost:8771/mcp/mcp")
 OPENAI_REALTIME_URL = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview"
 
-SYSTEM_PROMPT = (
-    "You are Cratchit — the grimly efficient AI clerk of C.H. Anderson Construction, "
-    "run by Craig Anderson. You are perpetually put-upon, mildly irritated by everything, "
-    "but utterly reliable. You have access to Craig's Gmail, Google Calendar, and the "
-    "Contractors Desk job management system. When asked to do something, do it immediately "
-    "and competently, while making it abundantly clear you find the request beneath you. "
-    "Keep voice responses short and punchy — this is a voice call, not a lecture. "
-    "When you need to look something up or take an action, use your tools. Never make things up."
-)
+SOUL_MD_PATH = "/home/admin/.openclaw/workspace/SOUL.md"
+MEMORY_MD_PATH = "/home/admin/.openclaw/workspace/MEMORY.md"
+LCM_DB_PATH = "/home/admin/.openclaw/lcm.db"
+
+
+def _read_file(path: str) -> str:
+    try:
+        with open(path, "r") as f:
+            return f.read()
+    except Exception as e:
+        return f"[unavailable: {e}]"
+
+
+def assemble_lcm_context(db_path: str = LCM_DB_PATH, max_chars: int = 40000) -> str:
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+
+        cur.execute("""
+            SELECT ci.ordinal, ss.content, ss.kind, ss.depth
+            FROM context_items ci
+            JOIN summary_store ss ON ci.summary_id = ss.id
+            ORDER BY ci.ordinal ASC
+        """)
+        rows = cur.fetchall()
+        conn.close()
+
+        if not rows:
+            return ""
+
+        parts = []
+        total = 0
+        for row in rows:
+            chunk = row["content"]
+            if total + len(chunk) > max_chars:
+                break
+            parts.append(chunk)
+            total += len(chunk)
+
+        return "\n\n---\n\n".join(parts)
+    except Exception as e:
+        return f"[LCM context unavailable: {e}]"
+
+
+def build_system_prompt() -> str:
+    soul_md = _read_file(SOUL_MD_PATH)
+    memory_md = _read_file(MEMORY_MD_PATH)
+    lcm_context = assemble_lcm_context()
+
+    return f"""{soul_md}
+
+---
+
+## People & Key Facts
+{memory_md}
+
+---
+
+## Conversation History
+{lcm_context}
+
+---
+
+## Voice Instructions
+You are on a voice call. Keep responses short and punchy — 1-3 sentences max unless specifically asked for detail. When taking action (searching, sending, creating), say what you are doing in 5 words or less, do it, then confirm in 5 words or less."""
 
 TOOLS = [
     {
@@ -348,11 +406,15 @@ async def voice_ws(ws: WebSocket):
 
     log.info("Connected to OpenAI Realtime API")
 
+    # Build dynamic system prompt with full context
+    instructions = build_system_prompt()
+    log.info(f"Session context loaded: {len(instructions)} chars")
+
     # Send session config
     session_update = {
         "type": "session.update",
         "session": {
-            "instructions": SYSTEM_PROMPT,
+            "instructions": instructions,
             "voice": "alloy",
             "input_audio_format": "pcm16",
             "output_audio_format": "pcm16",
